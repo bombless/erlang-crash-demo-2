@@ -110,7 +110,7 @@ handle_call(stop, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({heartbeat, DeviceId, Protocol}, State) ->
+handle_cast({heartbeat, DeviceId, _Protocol}, State) ->
     Now = erlang:system_time(second),
     Devices = case maps:get(DeviceId, State#state.devices, undefined) of
         undefined ->
