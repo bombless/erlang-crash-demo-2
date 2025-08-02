@@ -11,13 +11,13 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 %% 设备进程相关exports
--export([start_devices/1, device_process/1, heartbeat_server/1, http_server/1]).
+-export([start_devices/1, device_process/1, heartbeat_server/2, http_server/1]).
 
 -define(DEVICE_COUNT, 3).
 -define(HEARTBEAT_INTERVAL, 5000).  % 5秒心跳间隔
 -define(CRASH_PROBABILITY, 0.02).   % 2%崩溃概率
--define(TCP_PORT, 8888).
--define(UDP_PORT, 8889).
+-define(TCP_PORT, 18888).
+-define(UDP_PORT, 18889).
 -define(HTTP_PORT, 8080).
 
 -record(device_state, {
@@ -61,11 +61,11 @@ init([]) ->
     
     % 启动TCP服务器
     {ok, TcpSocket} = gen_tcp:listen(?TCP_PORT, [binary, {packet, 0}, {active, true}, {reuseaddr, true}]),
-    spawn_link(?MODULE, heartbeat_server, [tcp]),
+    spawn_link(?MODULE, heartbeat_server, [tcp, TcpSocket]),
     
     % 启动UDP服务器
     {ok, UdpSocket} = gen_udp:open(?UDP_PORT, [binary, {active, true}]),
-    spawn_link(?MODULE, heartbeat_server, [udp]),
+    spawn_link(?MODULE, heartbeat_server, [udp, UdpSocket]),
     
     % 启动HTTP服务器
     HttpPid = spawn_link(?MODULE, http_server, [?HTTP_PORT]),
@@ -110,7 +110,7 @@ handle_call(stop, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({heartbeat, DeviceId, _Protocol}, State) ->
+handle_cast({heartbeat, DeviceId, Protocol}, State) ->
     Now = erlang:system_time(second),
     Devices = case maps:get(DeviceId, State#state.devices, undefined) of
         undefined ->
@@ -123,7 +123,7 @@ handle_cast({heartbeat, DeviceId, _Protocol}, State) ->
             },
             maps:put(DeviceId, UpdatedDevice, State#state.devices)
     end,
-    % io:format("设备 ~p 通过 ~p 发送心跳~n", [DeviceId, Protocol]),
+    io:format("设备 ~p 通过 ~p 发送心跳~n", [DeviceId, Protocol]),
     {noreply, State#state{devices = Devices}};
 
 handle_cast({device_crashed, DeviceId}, State) ->
@@ -202,11 +202,13 @@ code_change(_OldVsn, State, _Extra) ->
 
 start_devices(Count) ->
     lists:foldl(fun(Id, Acc) ->
-        Pid = spawn_link(?MODULE, device_process, [Id]),
+        % Command = io_lib:format("erl -noshell -s ~s device_process ~p -s init stop", [?MODULE, Id]),
+        Command = io_lib:format("erl -s ~s device_process ~p -s init stop", [?MODULE, Id]),
+        Port = open_port({spawn, Command}, [{packet, 2}, binary, exit_status]),
         Now = erlang:system_time(second),
         Device = #device_state{
             id = Id,
-            pid = Pid,
+            pid = Port,
             last_heartbeat = Now,
             status = online,
             offline_time = undefined
@@ -215,6 +217,15 @@ start_devices(Count) ->
     end, #{}, lists:seq(1, Count)).
 
 device_process(DeviceId) ->
+    if is_list(DeviceId) ->
+        io:format("设备ID应为整数，接收到列表: ~p~n", [DeviceId]);
+    is_atom(DeviceId) ->
+        io:format("设备ID应为整数，接收到原子: ~p~n", [DeviceId]);
+    is_integer(DeviceId) ->
+        io:format("设备ID为整数: ~p~n", [DeviceId]);
+    true ->
+        io:format("设备ID类型未知: ~p~n", [DeviceId])
+    end,
     % 随机选择心跳协议
     Protocol = case rand:uniform(2) of
         1 -> tcp;
@@ -237,7 +248,8 @@ device_process(DeviceId) ->
 send_heartbeat(DeviceId, tcp) ->
     case gen_tcp:connect("localhost", ?TCP_PORT, [binary, {packet, 0}]) of
         {ok, Socket} ->
-            Data = iolist_to_binary(io_lib:format("HEARTBEAT:~p", [DeviceId])),
+            Data = iolist_to_binary(io_lib:format("HEARTBEAT:~s", [atom_to_list(X) || X <- DeviceId])),
+            io:format("发送心跳数据: ~p~n", [Data]), % 添加调试日志
             gen_tcp:send(Socket, Data),
             gen_tcp:close(Socket);
         {error, _} ->
@@ -247,7 +259,8 @@ send_heartbeat(DeviceId, tcp) ->
 send_heartbeat(DeviceId, udp) ->
     case gen_udp:open(0) of
         {ok, Socket} ->
-            Data = iolist_to_binary(io_lib:format("HEARTBEAT:~p", [DeviceId])),
+            Data = iolist_to_binary(io_lib:format("HEARTBEAT:~s", [atom_to_list(X) || X <- DeviceId])),
+            io:format("发送心跳数据: ~p~n", [Data]), % 添加调试日志
             gen_udp:send(Socket, "localhost", ?UDP_PORT, Data),
             gen_udp:close(Socket);
         {error, _} ->
@@ -268,21 +281,11 @@ handle_heartbeat_data(Data, Protocol) ->
             io:format("未知的数据格式: ~p~n", [Data])
     end.
 
-heartbeat_server(tcp) ->
-    case gen_tcp:listen(?TCP_PORT, [binary, {packet, 0}, {active, true}, {reuseaddr, true}]) of
-        {ok, ListenSocket} ->
-            tcp_accept_loop(ListenSocket);
-        {error, Reason} ->
-            io:format("TCP服务器启动失败: ~p~n", [Reason])
-    end;
+heartbeat_server(tcp, Sock) ->
+    tcp_accept_loop(Sock);
 
-heartbeat_server(udp) ->
-    case gen_udp:open(?UDP_PORT, [binary, {active, true}]) of
-        {ok, Socket} ->
-            udp_receive_loop(Socket);
-        {error, Reason} ->
-            io:format("UDP服务器启动失败: ~p~n", [Reason])
-    end.
+heartbeat_server(udp, Sock) ->
+    udp_receive_loop(Sock).
 
 tcp_accept_loop(ListenSocket) ->
     case gen_tcp:accept(ListenSocket) of
